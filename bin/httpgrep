@@ -1,0 +1,8 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use HTTPGrep;
+
+my $hg = HTTPGrep->new_with_options();
+$hg->run();
