@@ -63,3 +63,18 @@ $ httpgrep --urifile ~/work/mydomains.csv
 If you want a lazy way to keep running a scan over and over,
 
 $ while [ 1 ] ; do httpgrep --urifile ~/work/mydomains.csv ; done
+
+SCHEMA
+
+Here are the redis keys and what they are used for:
+    uri_queue: seed uris to be processed.
+    live_match:$name: list of uris that matched the regex with name $name
+    last_match:$name: list of uris that were matched in the last (completed) run of the scan
+    last_match:$name:$class
+        # set of "key:seed:uri:ptr" entries, process when processing
+    ever_matched: list of uri's that have ever been matched
+    scan_start: epoch time of when current scan started
+    scan_size:  original length(<uri_queue>)
+    ptr_classifications: set of types we discover from ptrclassify list
+    scanned_scripts: set of scripts we have scanned, avoid re-scan. Flush periodically
+
