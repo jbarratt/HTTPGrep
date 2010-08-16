@@ -273,7 +273,7 @@ sub completion_estimate {
 
     # simple projection, we have done X per second, so how many seconds until done?
     my $uri_per_sec = ($orig_size-$now_size)/($now-$launch_ts);
-    return parseInterval(seconds => int($now_size*$uri_per_sec), String => 1);
+    return parseInterval(seconds => int($now_size/$uri_per_sec), String => 1);
 }
 
 sub BUILD {
