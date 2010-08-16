@@ -1,0 +1,65 @@
+HTTPGrep
+
+This is a data-driven system for scanning a number of websites for content matching certain regular expressions. It could be used for things like copyright infringement checks, scanning for
+out-of-date software, or looking for exploited content. It uses AnyEvent::HTTP to do the heavy lifting on web querying, and Redis to store in-progress and analyzed data.
+
+
+BASICS
+
+The application needs 2 things to work:
+- a list of URI's in CSV format: <key>,<URI>, where 'key' is any bit of information you want to store about that URI.
+- a config file (by default, /etc/httpgrep.yml.)
+
+The config file specifies 2 sets of regular expressions:
+- things to look for on a page
+- what to call the hosts you find this content on
+
+The application does only do a 'shallow scan' (though this could be made configurable) -- it only downloads the initial page, and all <script src=""> links afterwards.
+
+The app has 3 phases:
+- loading the list of URI's to scan for
+- actually scanning them
+- summarizing and reporting on the information
+
+Typically it'll just be run in a loop..
+
+There is a companion app, HTTPGrepUI, which is simple Dancer web-based frontent.
+
+INSTALLATION
+
+* Install Redis
+* Install this module and all it's prereqs (should be handled automatically by cpan, if not try cpanm)
+
+
+CONFIGURATION
+
+Here is a basic YAML file that would scan for people direct linking to your logo files.
+---
+debug: 0
+user_agent: 'My-Scanner/0.1 (+contact@me.com)'
+max_active: 25
+search_pat:
+    bg_image: 'mydomain\.com\/images\/bg.jpg'
+    logo_image: 'mydomain\.com\/images\/logo.jpg'
+ptr_pat:
+    internal: '\.mydomain\.com'
+    yahoo: 'yahoo\.com'
+
+
+Here's a sample input file. Each link should be prefaced by some kind of 'key', which can help you by keeping track of where you got a given link.
+Say you are doing the above to make sure that people in your partner and referral programs are linking to you. You may flag which one is which.
+
+partner,foo.com
+partner,someotherdomain.com
+referrer,nicedomain.com
+
+In the reporting, you'll be able to see which 'key' a given link was associated with.
+
+
+RUNNING
+
+$ httpgrep --urifile ~/work/mydomains.csv
+
+If you want a lazy way to keep running a scan over and over,
+
+$ while [ 1 ] ; do httpgrep --urifile ~/work/mydomains.csv ; done
