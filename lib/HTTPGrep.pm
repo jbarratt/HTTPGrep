@@ -109,8 +109,9 @@ sub scan_content {
     my ($self, %arg) = @_;
     return unless defined($arg{body}); #huh, empty body?
     
-    while(my($name, $pattern) = each %{$self->{search_pat}}) {
-        if($arg{body} =~ /$pattern/) {
+    for my $name (keys %{$self->search_pat}) {
+        my $pat = $self->search_pat->{$name};
+        if($arg{body} =~ /$pat/) {
             $self->r->sadd("live_match:$name", $arg{uri});
         }
     }
@@ -235,8 +236,9 @@ sub finalize_scan {
 
 sub find_classification {
     my($self, $c) = @_;
-    while(my($name, $pattern) = each %{$self->{ptr_pat}}) {
-        if($c =~ /$pattern/) {
+    for my $name (keys %{$self->ptr_pat}) {
+        my $pat = $self->ptr_pat->{$name};
+        if($c =~ /$pat/) {
             return "$name-$1";
         }
     }
