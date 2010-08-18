@@ -149,28 +149,32 @@ sub scan_content {
 sub initialize_scan {
     my($self) = @_;
 
-    # start with an empty list
-    $self->r->del('uri_queue');
-
-    # optionally flush the list of 'script uris we have already processed'
-    # want to periodically flush to keep track of new patterns.
-    my $last_scanned_reset = $self->r->get('last_scanned_reset') || 0;
-    if((time - $last_scanned_reset) > $self->rescan_time) {
-        $self->r->del('scanned_scripts');
-        $self->r->set('last_scanned_reset', time);
-    }
+    my $queue_size = $self->r->llen('uri_queue') || 0;
     
-    # don't want to scan the sites in sequential order, randomize the domain list
-    # (sequential == overloading 1 hostserver @ a time)
-    for my $d (shuffle(keys %{$self->urimap})) {
-        if($d !~ /^http/) {
-            $self->r->rpush('uri_queue', "http://$d");
-        } else {
-            $self->r->rpush('uri_queue', $d);
+    # start with an empty list, unless this is a restart
+    if($queue_size > 0) {
+        $self->r->del('uri_queue');
+
+        # optionally flush the list of 'script uris we have already processed'
+        # want to periodically flush to keep track of new patterns.
+        my $last_scanned_reset = $self->r->get('last_scanned_reset') || 0;
+        if((time - $last_scanned_reset) > $self->rescan_time) {
+            $self->r->del('scanned_scripts');
+            $self->r->set('last_scanned_reset', time);
         }
+        
+        # don't want to scan the sites in sequential order, randomize the domain list
+        # (sequential == overloading 1 hostserver @ a time)
+        for my $d (shuffle(keys %{$self->urimap})) {
+            if($d !~ /^http/) {
+                $self->r->rpush('uri_queue', "http://$d");
+            } else {
+                $self->r->rpush('uri_queue', $d);
+            }
+        }
+        $self->r->set('scan_start', time());
+        $self->r->set('scan_size', $self->r->llen('uri_queue'));
     }
-    $self->r->set('scan_start', time());
-    $self->r->set('scan_size', $self->r->llen('uri_queue'));
 }
 
 =method finalize_scan
