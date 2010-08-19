@@ -35,7 +35,7 @@ has 'max_active'  => (is => 'ro', isa => 'Int', default => 20);
 has 'rec_per_c'   => (is => 'ro', isa => 'Int', default => 2_000);
 has 'search_pat'  => (is => 'ro', isa => 'HashRef', required => 1);
 has 'ptr_pat'     => (is => 'ro', isa => 'HashRef', required => 1);
-has 'run_forever' => (is => 'ro', isa => 'Bool', default => 1);
+has 'runforever'  => (is => 'ro', isa => 'Bool', default => 1);
 
 # internal
 has 'urimap'      => (is => 'rw', isa => 'HashRef', default => sub { {} });
@@ -72,7 +72,7 @@ sub run {
         print "Children complete. Finalizing scan...\n";
         $self->finalize_scan();
         print "Scan complete.\n";
-    } while ($self->run_forever);
+    } while ($self->runforever);
 }
 
 =method queue_size
@@ -239,7 +239,6 @@ sub finalize_scan {
             next if($submitted{$domain});
             $submitted{$domain}++;
             my $q = $adns->submit($domain, ADNS_R_A);
-            print "SUBMIT: $domain\n";
             $q->{match_uri} = $uri;
             $q->{match_type} = $search;
             $q->{orig_domain} = $domain;
@@ -256,7 +255,6 @@ sub finalize_scan {
         next unless defined($a);
         if(defined($a->{records}[0])) {
             if($a->{records}[0] =~ /(\d+)\.(\d+)\.(\d+)\.(\d+)/) {
-                print "RETURN: $a->{records}[0]\n";
                 my $arpa = "$4.$3.$2.$1.in-addr.arpa";
                 if($submitted{$arpa}) {
                     next;
@@ -267,7 +265,6 @@ sub finalize_scan {
                 $q->{match_type} = $a->{match_type};
                 $q->{match_uri} = $a->{match_uri};
             } elsif ($a->{type} eq "PTR") {
-                print "RETURN: $a->{records}[0]\n";
                 my $key = $self->find_domain_key($a->{orig_domain});
         
                 my $class = $self->find_classification($a->{records}[0]);
