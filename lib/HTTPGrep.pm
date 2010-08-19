@@ -17,6 +17,8 @@ use Net::ADNS qw(ADNS_R_A ADNS_R_PTR);
 use List::Util qw(shuffle);
 use Time::Interval;
 use Carp::Always;
+use Data::Dumper;
+use Socket;
 
 use Moose;
 use namespace::autoclean;
@@ -36,6 +38,7 @@ has 'rec_per_c'   => (is => 'ro', isa => 'Int', default => 2_000);
 has 'search_pat'  => (is => 'ro', isa => 'HashRef', required => 1);
 has 'ptr_pat'     => (is => 'ro', isa => 'HashRef', required => 1);
 has 'runforever'  => (is => 'ro', isa => 'Bool', default => 1);
+has 'finalizeonly' => (is => 'ro', isa => 'Bool', default => 0);
 
 # internal
 has 'urimap'      => (is => 'rw', isa => 'HashRef', default => sub { {} });
@@ -52,27 +55,31 @@ has 'rec_procd'   => (is => 'rw', isa => 'Int', default => 0);
 
 sub run {
     my($self) = @_;
-    $self->pm(Parallel::ForkManager->new($self->cores));
-    do {
-        $self->initialize_scan();
-        while(1) {
-            my $q = $self->queue_size;
-            last unless $q;
-            print "[$$] Queue: $q. Completion estimated in " . $self->completion_estimate . ", running for " . $self->run_time . "\n";
-            print "Launching child...\n";
-            $self->pm->start && next;
-            print "\t ...[$$]\n";
-            $self->scanning_child();
-            $self->pm->finish; # should never get hit.
-            die "Got to code that shouldn't get hit\n";
-            last; # also shouldn't get hit, but just in case.
-        }
-        print "Queue empty. Waiting for all children to complete processing.\n";
-        $self->pm->wait_all_children;
-        print "Children complete. Finalizing scan...\n";
+    if($self->finalizeonly) {
         $self->finalize_scan();
-        print "Scan complete.\n";
-    } while ($self->runforever);
+    } else {
+        $self->pm(Parallel::ForkManager->new($self->cores));
+        do {
+            $self->initialize_scan();
+            while(1) {
+                my $q = $self->queue_size;
+                last unless $q;
+                print "[$$] Queue: $q. Completion estimated in " . $self->completion_estimate . ", running for " . $self->run_time . "\n";
+                print "Launching child...\n";
+                $self->pm->start && next;
+                print "\t ...[$$]\n";
+                $self->scanning_child();
+                $self->pm->finish; # should never get hit.
+                die "Got to code that shouldn't get hit\n";
+                last; # also shouldn't get hit, but just in case.
+            }
+            print "Queue empty. Waiting for all children to complete processing.\n";
+            $self->pm->wait_all_children;
+            print "Children complete. Finalizing scan...\n";
+            $self->finalize_scan();
+            print "Scan complete.\n";
+        } while ($self->runforever);
+    } 
 }
 
 =method queue_size
@@ -193,6 +200,11 @@ sub initialize_scan {
     my($self) = @_;
 
     $self->r->del('uri_queue');
+    # clean up all the live_match buckets
+    for my $search (keys %{$self->search_pat}) {
+        print "deleting the queue live_match:$search\n";
+        $self->r->del("live_match:$search");
+    }
 
     # optionally flush the list of 'script uris we have already processed'
     # want to periodically flush to keep track of new patterns.
@@ -213,6 +225,8 @@ sub initialize_scan {
     }
     $self->r->set('scan_start', time());
     $self->r->set('scan_size', $self->r->llen('uri_queue'));
+
+    
 }
 
 =method finalize_scan
@@ -225,7 +239,6 @@ sub finalize_scan {
     my $adns = Net::ADNS->new();
     $self->reconnect_redis();
 
-    my %submitted = ();
     # store any values from this scan
     for my $search (keys %{$self->search_pat}) {
         $self->r->del("last_match:$search");
@@ -236,8 +249,6 @@ sub finalize_scan {
         
         for my $uri ($self->r->smembers("last_match:$search")) {
             my $domain = URI->new($uri)->host;
-            next if($submitted{$domain});
-            $submitted{$domain}++;
             my $q = $adns->submit($domain, ADNS_R_A);
             $q->{match_uri} = $uri;
             $q->{match_type} = $search;
@@ -254,22 +265,36 @@ sub finalize_scan {
         my $a = $adns->check($query);
         next unless defined($a);
         if(defined($a->{records}[0])) {
-            if($a->{records}[0] =~ /(\d+)\.(\d+)\.(\d+)\.(\d+)/) {
+            if($a->{type} ne "PTR" && $a->{records}[0] =~ /(\d+)\.(\d+)\.(\d+)\.(\d+)/) {
                 my $arpa = "$4.$3.$2.$1.in-addr.arpa";
-                if($submitted{$arpa}) {
-                    next;
-                }
                 my $q = $adns->submit("$4.$3.$2.$1.in-addr.arpa", ADNS_R_PTR);
-                $submitted{$arpa}++;
                 $q->{orig_domain} = $a->{orig_domain};
                 $q->{match_type} = $a->{match_type};
                 $q->{match_uri} = $a->{match_uri};
+                $q->{ip} = $a->{records}[0];
             } elsif ($a->{type} eq "PTR") {
                 my $key = $self->find_domain_key($a->{orig_domain});
         
                 my $class = $self->find_classification($a->{records}[0]);
                 $classifications{$class}++;
                 $self->r->sadd("last_match:$a->{match_type}:$class", "$key,$a->{orig_domain},$a->{match_uri},$a->{records}[0]"); 
+            } else {
+                print "Got an unmatched record\n";
+                print Dumper($a);
+            }
+        } else {
+            # some kind of failure to reverse this IP
+            if($a->{type} eq "PTR") {
+                # there is a bug in libadns where multiple PTR's cause an error
+                # http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=467485
+                # workaround by calling gethostbyaddr instead
+                my $ptr_host = (gethostbyaddr(inet_aton($a->{ip}), AF_INET))[0] || $a->{owner};
+                my $key = $self->find_domain_key($a->{orig_domain});
+                my $class = $self->find_classification($ptr_host);
+                $classifications{$class}++;
+                $self->r->sadd("last_match:$a->{match_type}:$class", "$key,$a->{orig_domain},$a->{match_uri},$ptr_host"); 
+            } else {
+                print Dumper($a);
             }
         }
     }
