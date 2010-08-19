@@ -16,6 +16,7 @@ use Parallel::ForkManager;
 use Net::ADNS qw(ADNS_R_A ADNS_R_PTR);
 use List::Util qw(shuffle);
 use Time::Interval;
+use Carp::Always;
 
 use Moose;
 use namespace::autoclean;
@@ -31,8 +32,10 @@ has 'debug'       => (is => 'ro', isa => 'Bool', default => 0);
 has 'rescan_time' => (is => 'ro', isa => 'Int', default => 86400);
 has 'user_agent'  => (is => 'ro', isa => 'Str', required => 1);
 has 'max_active'  => (is => 'ro', isa => 'Int', default => 20);
+has 'rec_per_c'   => (is => 'ro', isa => 'Int', default => 2_000);
 has 'search_pat'  => (is => 'ro', isa => 'HashRef', required => 1);
 has 'ptr_pat'     => (is => 'ro', isa => 'HashRef', required => 1);
+has 'run_forever' => (is => 'ro', isa => 'Bool', default => 1);
 
 # internal
 has 'urimap'      => (is => 'rw', isa => 'HashRef', default => sub { {} });
@@ -40,6 +43,7 @@ has 'r'           => (is => 'rw', isa => 'Redis', lazy_build => 1);
 has 'cores'       => (is => 'ro', isa => 'Int', default => sub { Sys::CPU::cpu_count(); });
 has 'pm'          => (is => 'rw', isa => 'Parallel::ForkManager');
 has 'parser'      => (is => 'ro', isa => 'HTML::Parser', lazy_build => 1);
+has 'rec_procd'   => (is => 'rw', isa => 'Int', default => 0);
 
 =method run
     The main 'run' process (to be called by the daemon, not reporting tools.)
@@ -49,14 +53,39 @@ has 'parser'      => (is => 'ro', isa => 'HTML::Parser', lazy_build => 1);
 sub run {
     my($self) = @_;
     $self->pm(Parallel::ForkManager->new($self->cores));
-    $self->initialize_scan();
-    for (1 .. $self->cores) {
-        $self->pm->start && next;
-        $self->scanning_child();
-        $self->pm->finish; # should never get hit.
-    }
-    $self->pm->wait_all_children;
-    $self->finalize_scan();
+    do {
+        $self->initialize_scan();
+        while(1) {
+            my $q = $self->queue_size;
+            last unless $q;
+            print "[$$] Queue: $q. Completion estimated in " . $self->completion_estimate . ", running for " . $self->run_time . "\n";
+            print "Launching child...\n";
+            $self->pm->start && next;
+            print "\t ...[$$]\n";
+            $self->scanning_child();
+            $self->pm->finish; # should never get hit.
+            die "Got to code that shouldn't get hit\n";
+            last; # also shouldn't get hit, but just in case.
+        }
+        print "Queue empty. Waiting for all children to complete processing.\n";
+        $self->pm->wait_all_children;
+        print "Children complete. Finalizing scan...\n";
+        $self->finalize_scan();
+        print "Scan complete.\n";
+    } while ($self->run_forever);
+}
+
+=method queue_size
+    Returns the count of the queue size, including some nice recoonnect logic if needed.
+=cut
+
+sub queue_size {
+    my($self) = @_;
+    #eval { 
+    #    if(!$self->r->ping) { $self->reconnect_redis(); }; 
+    #};
+    $self->reconnect_redis();
+    return $self->r->llen('uri_queue');
 }
 
 =method scanning_child
@@ -75,6 +104,7 @@ sub scanning_child {
             while($AnyEvent::HTTP::ACTIVE < $self->{max_active}) {
                 my $uri = $self->r->lpop('uri_queue');
                 last unless defined($uri);
+                last unless $self->process_another(1);
                 http_request
                     GET => $uri,
                     timeout => 15,
@@ -94,11 +124,25 @@ sub scanning_child {
         cb       => sub {
             if($AnyEvent::HTTP::ACTIVE == 0) {
                 $self->pm->finish; # don't exit(1), our parent will forget about us.
+            } elsif(!$self->process_another) {
+               print "\t\tChild [$$] hit max requests; $AnyEvent::HTTP::ACTIVE requests outstanding.\n"; 
             }
         },
     );
 
     AnyEvent->condvar->recv;
+}
+
+sub process_another {
+    my($self, $inc) = @_;
+    my $p = $self->rec_procd;
+    if($p > $self->rec_per_c) {
+        print "\t\tChild [$$] hit max requests, letting work finish up.\n";
+        return 0;
+    } elsif($inc) {
+        $self->rec_procd($p+$inc);
+    }
+    return 1;
 }
 
 =method scan_content
@@ -149,32 +193,27 @@ sub scan_content {
 sub initialize_scan {
     my($self) = @_;
 
-    my $queue_size = $self->r->llen('uri_queue') || 0;
-    
-    # start with an empty list, unless this is a restart
-    if($queue_size > 0) {
-        $self->r->del('uri_queue');
+    $self->r->del('uri_queue');
 
-        # optionally flush the list of 'script uris we have already processed'
-        # want to periodically flush to keep track of new patterns.
-        my $last_scanned_reset = $self->r->get('last_scanned_reset') || 0;
-        if((time - $last_scanned_reset) > $self->rescan_time) {
-            $self->r->del('scanned_scripts');
-            $self->r->set('last_scanned_reset', time);
-        }
-        
-        # don't want to scan the sites in sequential order, randomize the domain list
-        # (sequential == overloading 1 hostserver @ a time)
-        for my $d (shuffle(keys %{$self->urimap})) {
-            if($d !~ /^http/) {
-                $self->r->rpush('uri_queue', "http://$d");
-            } else {
-                $self->r->rpush('uri_queue', $d);
-            }
-        }
-        $self->r->set('scan_start', time());
-        $self->r->set('scan_size', $self->r->llen('uri_queue'));
+    # optionally flush the list of 'script uris we have already processed'
+    # want to periodically flush to keep track of new patterns.
+    my $last_scanned_reset = $self->r->get('last_scanned_reset') || 0;
+    if((time - $last_scanned_reset) > $self->rescan_time) {
+        $self->r->del('scanned_scripts');
+        $self->r->set('last_scanned_reset', time);
     }
+    
+    # don't want to scan the sites in sequential order, randomize the domain list
+    # (sequential == overloading 1 hostserver @ a time)
+    for my $d (shuffle(keys %{$self->urimap})) {
+        if($d !~ /^http/) {
+            $self->r->rpush('uri_queue', "http://$d");
+        } else {
+            $self->r->rpush('uri_queue', $d);
+        }
+    }
+    $self->r->set('scan_start', time());
+    $self->r->set('scan_size', $self->r->llen('uri_queue'));
 }
 
 =method finalize_scan
@@ -187,6 +226,7 @@ sub finalize_scan {
     my $adns = Net::ADNS->new();
     $self->reconnect_redis();
 
+    my %submitted = ();
     # store any values from this scan
     for my $search (keys %{$self->search_pat}) {
         $self->r->del("last_match:$search");
@@ -197,7 +237,10 @@ sub finalize_scan {
         
         for my $uri ($self->r->smembers("last_match:$search")) {
             my $domain = URI->new($uri)->host;
+            next if($submitted{$domain});
+            $submitted{$domain}++;
             my $q = $adns->submit($domain, ADNS_R_A);
+            print "SUBMIT: $domain\n";
             $q->{match_uri} = $uri;
             $q->{match_type} = $search;
             $q->{orig_domain} = $domain;
@@ -214,11 +257,18 @@ sub finalize_scan {
         next unless defined($a);
         if(defined($a->{records}[0])) {
             if($a->{records}[0] =~ /(\d+)\.(\d+)\.(\d+)\.(\d+)/) {
+                print "RETURN: $a->{records}[0]\n";
+                my $arpa = "$4.$3.$2.$1.in-addr.arpa";
+                if($submitted{$arpa}) {
+                    next;
+                }
                 my $q = $adns->submit("$4.$3.$2.$1.in-addr.arpa", ADNS_R_PTR);
+                $submitted{$arpa}++;
                 $q->{orig_domain} = $a->{orig_domain};
                 $q->{match_type} = $a->{match_type};
                 $q->{match_uri} = $a->{match_uri};
             } elsif ($a->{type} eq "PTR") {
+                print "RETURN: $a->{records}[0]\n";
                 my $key = $self->find_domain_key($a->{orig_domain});
         
                 my $class = $self->find_classification($a->{records}[0]);
@@ -273,14 +323,30 @@ sub find_domain_key {
 sub completion_estimate {
     my($self) = @_;
     my $now = time;
-    my $now_size = $self->r->llen('uri_queue');
+    my $now_size = $self->r->llen('uri_queue') || 0;
     my $orig_size = $self->r->get('scan_size');
     my $launch_ts = $self->r->get('scan_start');
 
+    if($now == $launch_ts) { return " [TBD] "; }
+
     # simple projection, we have done X per second, so how many seconds until done?
     my $uri_per_sec = ($orig_size-$now_size)/($now-$launch_ts);
+    if($uri_per_sec == 0) { return " [TBD] "; } 
     return parseInterval(seconds => int($now_size/$uri_per_sec), String => 1);
 }
+
+=method run_time
+    Human readable form of how long this scan has been running.
+=cut
+
+sub run_time {
+    my($self) = @_;
+    my $now = time;
+    my $launch_ts = $self->r->get('scan_start');
+
+    return parseInterval(seconds => int($now-$launch_ts), String => 1);
+}
+
 
 sub BUILD {
     my ($self) = @_;
