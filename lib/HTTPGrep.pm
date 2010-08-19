@@ -137,7 +137,6 @@ sub process_another {
     my($self, $inc) = @_;
     my $p = $self->rec_procd;
     if($p > $self->rec_per_c) {
-        print "\t\tChild [$$] hit max requests, letting work finish up.\n";
         return 0;
     } elsif($inc) {
         $self->rec_procd($p+$inc);
