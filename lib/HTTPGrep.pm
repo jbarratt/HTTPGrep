@@ -30,6 +30,7 @@ has '+configfile' => (default => '/etc/httpgrep.yml');
 
 # set in config file or on CLI
 has 'urifile'     => (is => 'ro', isa => 'Str'); 
+has 'oneuri'      => (is => 'ro', isa => 'Str');
 has 'debug'       => (is => 'ro', isa => 'Bool', default => 0);
 has 'rescan_time' => (is => 'ro', isa => 'Int', default => 86400);
 has 'user_agent'  => (is => 'ro', isa => 'Str', required => 1);
@@ -47,6 +48,7 @@ has 'cores'       => (is => 'ro', isa => 'Int', default => sub { Sys::CPU::cpu_c
 has 'pm'          => (is => 'rw', isa => 'Parallel::ForkManager');
 has 'parser'      => (is => 'ro', isa => 'HTML::Parser', lazy_build => 1);
 has 'rec_procd'   => (is => 'rw', isa => 'Int', default => 0);
+has 'oneuri_procd'    => (is => 'rw', isa => 'Bool', default => 0);
 
 =method run
     The main 'run' process (to be called by the daemon, not reporting tools.)
@@ -57,7 +59,18 @@ sub run {
     my($self) = @_;
     if($self->finalizeonly) {
         $self->finalize_scan();
+    } elsif($self->oneuri) {
+        # just run the scan for this one URI (for testing)
+        # shouldn't touch redis at all and/or interrupt a 'real' running scan
+        $self->pm(Parallel::ForkManager->new(1));
+        if($self->pm->start) {
+            $self->pm->wait_all_children;
+            exit;
+        } else {
+            $self->scanning_child();
+        }
     } else {
+        # Run the full scan in normal mode
         $self->pm(Parallel::ForkManager->new($self->cores));
         do {
             $self->initialize_scan();
@@ -101,15 +114,18 @@ sub queue_size {
 
 sub scanning_child {
     my($self) = @_;
-
-    $self->reconnect_redis();
+    
+    if(!$self->oneuri) {
+        $self->reconnect_redis();
+    }
 
     my $t; $t = AnyEvent->timer(
         after    => 1,
         interval => 1,
         cb       => sub {
             while($AnyEvent::HTTP::ACTIVE < $self->{max_active}) {
-                my $uri = $self->r->lpop('uri_queue');
+                #my $uri = $self->r->lpop('uri_queue');
+                my $uri = $self->dequeue_uri();
                 last unless defined($uri);
                 last unless $self->process_another(1);
                 http_request
@@ -162,7 +178,8 @@ sub scan_content {
     for my $name (keys %{$self->search_pat}) {
         my $pat = $self->search_pat->{$name};
         if($arg{body} =~ /$pat/) {
-            $self->r->sadd("live_match:$name", $arg{uri});
+            #$self->r->sadd("live_match:$name", $arg{uri});
+            $self->add_match("$name", $arg{uri});
         }
     }
     if($arg{depth} <= 1) {
@@ -172,7 +189,7 @@ sub scan_content {
                 sub { my($t, $a) = @_;
                     if($a->{'src'}) {
                         my $dest_uri = URI->new_abs($a->{src}, $uri);
-                        if(!$self->r->sismember('scanned_scripts', $dest_uri->as_string)) {
+                        if(!$self->already_scanned($dest_uri->as_string)) {
                             http_request
                                 GET => $dest_uri->as_string,
                                 timeout => 15,
@@ -182,12 +199,70 @@ sub scan_content {
                                         $self->scan_content(uri => $dest_uri->as_string, body => $body, depth => ($arg{depth}+1));
                                     }
                             };
-                            $self->r->sadd('scanned_scripts', $dest_uri->as_string);
+                            #$self->r->sadd('scanned_scripts', $dest_uri->as_string);
+                            $self->mark_scanned($dest_uri->as_string);
                         }
                     }
                },
         "tagname, attr");
         $self->parser->parse($arg{'body'});
+    }
+}
+
+=method dequeue_uri
+    Returns next uri in the processing queue (or virtual queue if we are in 'oneuri' mode
+=cut
+
+sub dequeue_uri {
+    my ($self) = @_;
+    if($self->oneuri) {
+        if($self->oneuri_procd) {
+            return undef;
+        } else {
+            $self->oneuri_procd(1);
+            return $self->oneuri;
+        }
+    } else {
+        return $self->r->lpop('uri_queue');
+    }
+}
+
+=method add_match
+    Register that a scanner matched a URI
+=cut
+
+sub add_match {
+    my ($self, $key, $uri) = @_;
+    if($self->oneuri) {
+        print "key $key matched uri $uri\n";
+    } else {
+        $self->r->sadd("live_match:$key", $uri);
+    }
+}
+
+=method mark_scanned
+    Mark that we have scanned a URI. This stops us from loading the same resource over and over (e.g. google jquery)
+=cut
+
+sub mark_scanned {
+    my ($self, $uri) = @_;
+    if($self->oneuri) {
+        print "Scanned: $uri\n";
+    } else {
+        $self->r->sadd('scanned_scripts', $uri);
+    }
+}
+
+=method already_scanned 
+    Checks if we've already seen a page as being scanned
+=cut
+
+sub already_scanned {
+    my ($self, $uri) = @_;
+    if($self->oneuri) {
+        return 0;
+    } else {
+        return $self->r->sismember('scanned_scripts', $uri)
     }
 }
 
