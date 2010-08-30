@@ -49,6 +49,7 @@ has 'pm'          => (is => 'rw', isa => 'Parallel::ForkManager');
 has 'parser'      => (is => 'ro', isa => 'HTML::Parser', lazy_build => 1);
 has 'rec_procd'   => (is => 'rw', isa => 'Int', default => 0);
 has 'oneuri_procd'    => (is => 'rw', isa => 'Bool', default => 0);
+has 'oneuri_scanned'    => (is => 'rw', isa => 'HashRef', default => sub { {} });
 
 =method run
     The main 'run' process (to be called by the daemon, not reporting tools.)
@@ -187,8 +188,8 @@ sub scan_content {
         $self->parser->handler(
             start => 
                 sub { my($t, $a) = @_;
-                    if($a->{'src'}) {
-                        my $dest_uri = URI->new_abs($a->{src}, $uri);
+                    if($a->{'src'} || $a->{'href'}) {
+                        my $dest_uri = URI->new_abs($a->{src} || $a->{href}, $uri);
                         if(!$self->already_scanned($dest_uri->as_string)) {
                             http_request
                                 GET => $dest_uri->as_string,
@@ -247,7 +248,7 @@ sub add_match {
 sub mark_scanned {
     my ($self, $uri) = @_;
     if($self->oneuri) {
-        print "Scanned: $uri\n";
+        $self->oneuri_scanned->{$uri}++;
     } else {
         $self->r->sadd('scanned_scripts', $uri);
     }
@@ -260,7 +261,7 @@ sub mark_scanned {
 sub already_scanned {
     my ($self, $uri) = @_;
     if($self->oneuri) {
-        return 0;
+        return defined($self->oneuri_scanned->{$uri});
     } else {
         return $self->r->sismember('scanned_scripts', $uri)
     }
@@ -464,7 +465,7 @@ sub _build_r {
 
 sub _build_parser {
     my $parser = HTML::Parser->new( api_version => 3);
-    $parser->report_tags(qw(script));
+    $parser->report_tags(qw(script a));
     return $parser;
 }
 sub reconnect_redis {
