@@ -25,6 +25,7 @@ use namespace::autoclean;
 
 with 'MooseX::SimpleConfig';
 with 'MooseX::Getopt';
+with 'MooseX::LazyLogDispatch';
 
 has '+configfile' => (default => '/etc/httpgrep.yml');
 
@@ -38,8 +39,8 @@ has 'max_active'  => (is => 'ro', isa => 'Int', default => 20);
 has 'rec_per_c'   => (is => 'ro', isa => 'Int', default => 2_000);
 has 'search_pat'  => (is => 'ro', isa => 'HashRef', required => 1);
 has 'ptr_pat'     => (is => 'ro', isa => 'HashRef', required => 1);
-has 'runforever'  => (is => 'ro', isa => 'Bool', default => 1);
 has 'finalizeonly' => (is => 'ro', isa => 'Bool', default => 0);
+has 'debug'       => (is => 'ro', isa => 'Bool', default => 0);
 
 # internal
 has 'urimap'      => (is => 'rw', isa => 'HashRef', default => sub { {} });
@@ -50,6 +51,27 @@ has 'parser'      => (is => 'ro', isa => 'HTML::Parser', lazy_build => 1);
 has 'rec_procd'   => (is => 'rw', isa => 'Int', default => 0);
 has 'oneuri_procd'    => (is => 'rw', isa => 'Bool', default => 0);
 has 'oneuri_scanned'    => (is => 'rw', isa => 'HashRef', default => sub { {} });
+
+has log_dispatch_conf => (
+    is => 'ro', isa => 'HashRef', lazy => 1, required => 1,
+    default => sub {
+        my $self = shift;
+        return ($self->debug || $self->oneuri)
+            ? {
+                class => 'Log::Dispatch::Screen',
+                min_level => 'debug',
+                stderr => 1,
+                format => '[%p] %m at %F line %L%n', 
+            }
+            : {
+                class => 'Log::Dispatch::Syslog',
+                min_level => 'info',
+                facility => 'daemon',
+                ident => 'httpgrep',
+                format => '[%p] %m',
+            };
+    },
+);
 
 =method run
     The main 'run' process (to be called by the daemon, not reporting tools.)
@@ -63,6 +85,7 @@ sub run {
     } elsif($self->oneuri) {
         # just run the scan for this one URI (for testing)
         # shouldn't touch redis at all and/or interrupt a 'real' running scan
+        $self->logger->info("scanning in --oneuri mode ($self->oneuri)");
         $self->pm(Parallel::ForkManager->new(1));
         if($self->pm->start) {
             $self->pm->wait_all_children;
@@ -72,27 +95,23 @@ sub run {
         }
     } else {
         # Run the full scan in normal mode
+        $self->logger->info("launching a full scan");
         $self->pm(Parallel::ForkManager->new($self->cores));
-        do {
-            $self->initialize_scan();
-            while(1) {
-                my $q = $self->queue_size;
-                last unless $q;
-                print "[$$] Queue: $q. Completion estimated in " . $self->completion_estimate . ", running for " . $self->run_time . "\n";
-                print "Launching child...\n";
-                $self->pm->start && next;
-                print "\t ...[$$]\n";
-                $self->scanning_child();
-                $self->pm->finish; # should never get hit.
-                die "Got to code that shouldn't get hit\n";
-                last; # also shouldn't get hit, but just in case.
-            }
-            print "Queue empty. Waiting for all children to complete processing.\n";
-            $self->pm->wait_all_children;
-            print "Children complete. Finalizing scan...\n";
-            $self->finalize_scan();
-            print "Scan complete.\n";
-        } while ($self->runforever);
+       
+        $self->initialize_scan();
+        while(1) {
+            my $q = $self->queue_size;
+            last unless $q;
+            $self->logger->debug("Queue: $q. Completion estimated in " . $self->completion_estimate . ", running for " . $self->run_time);
+            $self->pm->start && next;
+            $self->scanning_child();
+            $self->pm->finish; # should never get hit.
+        }
+        $self->logger->info("Queue empty. Waiting for all children to complete processing");
+        $self->pm->wait_all_children;
+        $self->logger->info("Children complete. Finalizing scan.");
+        $self->finalize_scan();
+        $self->logger->info("Scan Complete");
     } 
 }
 
@@ -149,7 +168,7 @@ sub scanning_child {
             if($AnyEvent::HTTP::ACTIVE == 0) {
                 $self->pm->finish; # don't exit(1), our parent will forget about us.
             } elsif(!$self->process_another) {
-               print "\t\tChild [$$] hit max requests; $AnyEvent::HTTP::ACTIVE requests outstanding.\n"; 
+               $self->logger->debug("Child [$$] hit max requests; $AnyEvent::HTTP::ACTIVE requests outstanding."); 
             }
         },
     );
@@ -179,8 +198,7 @@ sub scan_content {
     for my $name (keys %{$self->search_pat}) {
         my $pat = $self->search_pat->{$name};
         if($arg{body} =~ /$pat/) {
-            #$self->r->sadd("live_match:$name", $arg{uri});
-            $self->add_match("$name", $arg{uri});
+            $self->classify_uri("$name", $arg{uri});
         }
     }
     if($arg{depth} <= 1) {
@@ -228,19 +246,6 @@ sub dequeue_uri {
     }
 }
 
-=method add_match
-    Register that a scanner matched a URI
-=cut
-
-sub add_match {
-    my ($self, $key, $uri) = @_;
-    if($self->oneuri) {
-        print "key $key matched uri $uri\n";
-    } else {
-        $self->r->sadd("live_match:$key", $uri);
-    }
-}
-
 =method mark_scanned
     Mark that we have scanned a URI. This stops us from loading the same resource over and over (e.g. google jquery)
 =cut
@@ -275,13 +280,29 @@ sub already_scanned {
 sub initialize_scan {
     my($self) = @_;
 
-    $self->r->del('uri_queue');
-    # clean up all the live_match buckets
-    for my $search (keys %{$self->search_pat}) {
-        print "deleting the queue live_match:$search\n";
-        $self->r->del("live_match:$search");
-    }
+    if($self->queue_size <= 0) {
+        $self->logger->info("Queue empty. Reloading and resetting live_match");
+        $self->r->del('uri_queue');
+        # clean up all the live_match buckets
+        for my $search (keys %{$self->search_pat}) {
+            for my $class ($self->r->smembers("ptr_classifications")) {
+                $self->logger->debug("Flushing the queue live_match:$search:$class");
+                $self->r->del("live_match:$search:$class");
+            }
+        }
 
+        # don't want to scan the sites in sequential order, randomize the domain list
+        # (sequential == overloading 1 hostserver @ a time)
+        for my $d (shuffle(keys %{$self->urimap})) {
+            if($d !~ /^http/) {
+                $self->r->rpush('uri_queue', "http://$d");
+            } else {
+                $self->r->rpush('uri_queue', $d);
+            }
+        }
+    } else {
+        $self->logger->info("Queue not empty, resuming processing");
+    }
     # optionally flush the list of 'script uris we have already processed'
     # want to periodically flush to keep track of new patterns.
     my $last_scanned_reset = $self->r->get('last_scanned_reset') || 0;
@@ -290,93 +311,60 @@ sub initialize_scan {
         $self->r->set('last_scanned_reset', time);
     }
     
-    # don't want to scan the sites in sequential order, randomize the domain list
-    # (sequential == overloading 1 hostserver @ a time)
-    for my $d (shuffle(keys %{$self->urimap})) {
-        if($d !~ /^http/) {
-            $self->r->rpush('uri_queue', "http://$d");
-        } else {
-            $self->r->rpush('uri_queue', $d);
-        }
-    }
     $self->r->set('scan_start', time());
     $self->r->set('scan_size', $self->r->llen('uri_queue'));
+}
 
+=method classify_uri
+    Classify a URI, doing the lookups asynchronously.
+=cut
+
+sub classify_uri {
+    my($self, $type, $uri) = @_;
+    my $domain = URI->new($uri)->host;
     
+    AnyEvent::DNS::a $domain,
+        sub {
+            my $ip = shift;
+            if(!$ip) {
+                $self->logger->info("Unable to do a DNS lookup for $domain");
+                return;
+            }
+            AnyEvent::DNS::reverse_lookup $ip,
+                sub {
+                    my $reverse = shift;
+                    $reverse ||= "no_reverse";
+                    my $key = $self->find_domain_key($domain);
+                    my $class = $self->find_classification($reverse);
+                    $self->logger->info("Matched $type in $uri (Key: $key, Classification: $class)");
+                    if(!$self->oneuri) {
+                        $self->r->sadd("live_match:$type:$class", "$key,$domain,$uri,$reverse");
+                        $self->r->sadd('ptr_classifications', $class);
+                    }
+                };
+        };
+
 }
 
 =method finalize_scan
-    After a scan is complete, does PTR lookups on all domains and classifies them as per your regexes
+    After a scan is complete, copy 'live_match' to 'last_match'
 =cut
 
 sub finalize_scan {
     my($self) = @_;
     
-    my $adns = Net::ADNS->new();
-    $self->reconnect_redis();
-
     # store any values from this scan
     for my $search (keys %{$self->search_pat}) {
-        $self->r->del("last_match:$search");
-        # equivalent of a copy
-        $self->r->sunionstore("last_match:$search", "live_match:$search");
-        # merge these results into all those we have ever seen
-        $self->r->sunionstore("all_matches", "all_matches", "last_match:$search");
-        
-        for my $uri ($self->r->smembers("last_match:$search")) {
-            my $domain = URI->new($uri)->host;
-            my $q = $adns->submit($domain, ADNS_R_A);
-            $q->{match_uri} = $uri;
-            $q->{match_type} = $search;
-            $q->{orig_domain} = $domain;
-        }
         # clean these out. We'll go repopulate with current values
         for my $class ($self->r->smembers("ptr_classifications")) {
             $self->r->del("last_match:$search:$class");
+            
+            # equivalent of a copy
+            $self->r->sunionstore("last_match:$search:$class", "live_match:$search:$class");
+
+            # merge these results into all those we have ever seen
+            $self->r->sunionstore("all_matches", "all_matches", "last_match:$search:$class");
         }
-    }
-   
-    my %classifications = (); 
-    while(my $query = $adns->open_queries()) {        
-        my $a = $adns->check($query);
-        next unless defined($a);
-        if(defined($a->{records}[0])) {
-            if($a->{type} ne "PTR" && $a->{records}[0] =~ /(\d+)\.(\d+)\.(\d+)\.(\d+)/) {
-                my $arpa = "$4.$3.$2.$1.in-addr.arpa";
-                my $q = $adns->submit("$4.$3.$2.$1.in-addr.arpa", ADNS_R_PTR);
-                $q->{orig_domain} = $a->{orig_domain};
-                $q->{match_type} = $a->{match_type};
-                $q->{match_uri} = $a->{match_uri};
-                $q->{ip} = $a->{records}[0];
-            } elsif ($a->{type} eq "PTR") {
-                my $key = $self->find_domain_key($a->{orig_domain});
-        
-                my $class = $self->find_classification($a->{records}[0]);
-                $classifications{$class}++;
-                $self->r->sadd("last_match:$a->{match_type}:$class", "$key,$a->{orig_domain},$a->{match_uri},$a->{records}[0]"); 
-            } else {
-                print "Got an unmatched record\n";
-                print Dumper($a);
-            }
-        } else {
-            # some kind of failure to reverse this IP
-            if($a->{type} eq "PTR") {
-                # there is a bug in libadns where multiple PTR's cause an error
-                # http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=467485
-                # workaround by calling gethostbyaddr instead
-                my $ptr_host = (gethostbyaddr(inet_aton($a->{ip}), AF_INET))[0] || $a->{owner};
-                my $key = $self->find_domain_key($a->{orig_domain});
-                my $class = $self->find_classification($ptr_host);
-                $classifications{$class}++;
-                $self->r->sadd("last_match:$a->{match_type}:$class", "$key,$a->{orig_domain},$a->{match_uri},$ptr_host"); 
-            } else {
-                print Dumper($a);
-            }
-        }
-    }
-    $self->r->del('ptr_classifications');
-    for my $k (keys %classifications) {
-        $self->r->sadd('ptr_classifications', $k);
     }
 }
 
@@ -393,7 +381,25 @@ sub find_classification {
             return "$name-$1";
         }
     }
-    return "NO_CLASS";
+    return "Other";
+}
+
+=method get_results
+    Return raw results. 
+    'search=>' and 'class=>' can both optionally be provided to filter results.
+=cut
+
+sub get_results {
+    my($self, %arg) = @_;
+    my @results = ();
+    for my $search (keys %{$self->search_pat}) {
+        next if ($arg{'search'} && $arg{'search'} ne $search);
+        for my $class ($self->r->smembers("ptr_classifications")) {
+            next if ($arg{'class'} && $arg{'class'} ne $class);
+            push(@results, $self->r->sunion("live_match:$search:$class", "last_match:$search:$class"));
+        }
+    }
+    return @results;
 }
 
 =method find_domain_key
@@ -410,7 +416,7 @@ sub find_domain_key {
         return $key if $key;
         shift(@tokens);
     }
-    return "NO_KEY";
+    return "Other";
 }
 
 =method completion_estimate
@@ -465,7 +471,7 @@ sub _build_r {
 
 sub _build_parser {
     my $parser = HTML::Parser->new( api_version => 3);
-    $parser->report_tags(qw(script a));
+    $parser->report_tags(qw(script)); # add in 'a' to recurse a level deeper
     return $parser;
 }
 sub reconnect_redis {
