@@ -6,6 +6,5 @@ use HTTPGrep;
 package httpgrep;
 #ABSTRACT: executable skin for HTTPGrep module
 
-
 my $hg = HTTPGrep->new_with_options();
 $hg->run();

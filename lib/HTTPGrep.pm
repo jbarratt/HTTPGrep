@@ -13,12 +13,13 @@ use Time::HiRes qw(time);
 use Sys::CPU;
 use Getopt::Long;
 use Parallel::ForkManager;
-use Net::ADNS qw(ADNS_R_A ADNS_R_PTR);
 use List::Util qw(shuffle);
 use Time::Interval;
 use Carp::Always;
 use Data::Dumper;
+use Net::CIDR;
 use Socket;
+use Digest::MD5 qw(md5_hex);
 
 use Moose;
 use namespace::autoclean;
@@ -38,7 +39,7 @@ has 'user_agent'  => (is => 'ro', isa => 'Str', required => 1);
 has 'max_active'  => (is => 'ro', isa => 'Int', default => 20);
 has 'rec_per_c'   => (is => 'ro', isa => 'Int', default => 2_000);
 has 'search_pat'  => (is => 'ro', isa => 'HashRef', required => 1);
-has 'ptr_pat'     => (is => 'ro', isa => 'HashRef', required => 1);
+has 'cidr_map'    => (is => 'ro', isa => 'HashRef', required => 1);
 has 'finalizeonly' => (is => 'ro', isa => 'Bool', default => 0);
 has 'debug'       => (is => 'ro', isa => 'Bool', default => 0);
 
@@ -51,6 +52,7 @@ has 'parser'      => (is => 'ro', isa => 'HTML::Parser', lazy_build => 1);
 has 'rec_procd'   => (is => 'rw', isa => 'Int', default => 0);
 has 'oneuri_procd'    => (is => 'rw', isa => 'Bool', default => 0);
 has 'oneuri_scanned'    => (is => 'rw', isa => 'HashRef', default => sub { {} });
+has 'configfile_md5'   => (is => 'rw', isa => 'Str');
 
 has log_dispatch_conf => (
     is => 'ro', isa => 'HashRef', lazy => 1, required => 1,
@@ -85,7 +87,7 @@ sub run {
     } elsif($self->oneuri) {
         # just run the scan for this one URI (for testing)
         # shouldn't touch redis at all and/or interrupt a 'real' running scan
-        $self->logger->info("scanning in --oneuri mode ($self->oneuri)");
+        $self->logger->info("scanning in --oneuri mode (" . $self->oneuri . ")");
         $self->pm(Parallel::ForkManager->new(1));
         if($self->pm->start) {
             $self->pm->wait_all_children;
@@ -102,6 +104,7 @@ sub run {
         while(1) {
             my $q = $self->queue_size;
             last unless $q;
+            last if $self->config_modified;
             $self->logger->debug("Queue: $q. Completion estimated in " . $self->completion_estimate . ", running for " . $self->run_time);
             $self->pm->start && next;
             $self->scanning_child();
@@ -169,6 +172,12 @@ sub scanning_child {
                 $self->pm->finish; # don't exit(1), our parent will forget about us.
             } elsif(!$self->process_another) {
                $self->logger->debug("Child [$$] hit max requests; $AnyEvent::HTTP::ACTIVE requests outstanding."); 
+            }
+
+            if($self->config_modified) {
+                $self->logger->info("Config Modified. Finishing up active work and quitting.");
+                # fake being at max requests so we exit
+                $self->rec_procd($self->rec_per_c);
             }
         },
     );
@@ -330,20 +339,21 @@ sub classify_uri {
                 $self->logger->info("Unable to do a DNS lookup for $domain");
                 return;
             }
-            AnyEvent::DNS::reverse_lookup $ip,
-                sub {
-                    my $reverse = shift;
-                    $reverse ||= "no_reverse";
-                    my $key = $self->find_domain_key($domain);
-                    my $class = $self->find_classification($reverse);
-                    $self->logger->info("Matched $type in $uri (Key: $key, Classification: $class)");
-                    if(!$self->oneuri) {
-                        $self->r->sadd("live_match:$type:$class", "$key,$domain,$uri,$reverse");
-                        $self->r->sadd('ptr_classifications', $class);
-                    }
-                };
+            my $class = "Other";
+            for my $block (keys %{$self->cidr_map}) {
+                $self->logger->debug("Checking if IP $ip is a member of block $block");
+                if(Net::CIDR::cidrlookup($ip, ($block))) {
+                    $class = $self->cidr_map->{$block};
+                    last;
+                }
+            }
+            my $key = $self->find_domain_key($domain);
+            $self->logger->info("Matched $type in $uri (Key: $key, Classification: $class)");
+            if(!$self->oneuri) {
+                $self->r->sadd("live_match:$type:$class", "$key,$domain,$uri");
+                $self->r->sadd('ptr_classifications', $class);
+            }
         };
-
 }
 
 =method finalize_scan
@@ -366,22 +376,6 @@ sub finalize_scan {
             $self->r->sunionstore("all_matches", "all_matches", "last_match:$search:$class");
         }
     }
-}
-
-=method find_classification
-    Given a domain, figure out which classification you'd give it
-    Processes the defined classes in ptr_pat hash
-=cut
-
-sub find_classification {
-    my($self, $c) = @_;
-    for my $name (keys %{$self->ptr_pat}) {
-        my $pat = $self->ptr_pat->{$name};
-        if($c =~ /$pat/) {
-            return "$name-$1";
-        }
-    }
-    return "Other";
 }
 
 =method get_results
@@ -450,6 +444,33 @@ sub run_time {
     return parseInterval(seconds => int($now-$launch_ts), String => 1);
 }
 
+=method config_modified
+    Returns 1 if the md5sum of the config file has changed since creating the object
+=cut
+
+sub config_modified {
+    my ($self) = @_;
+    my $md5 = $self->get_configfile_md5();
+    if($md5 eq $self->configfile_md5) {
+        return 0;
+    } else {
+        $self->logger->debug("configfile checksum changed from " . $self->configfile_md5 . " to $md5");
+        return 1;
+    }
+}
+
+=method get_configfile_md5
+    returns the md5sum of the configfile
+=cut
+
+sub get_configfile_md5 {
+    my ($self) = @_;
+    open(my $fh, "<", $self->configfile);
+    my $contents = do { local $/ = <$fh> };
+    return md5_hex($contents);
+}
+
+
 
 sub BUILD {
     my ($self) = @_;
@@ -463,6 +484,9 @@ sub BUILD {
         }
     }
     $AnyEvent::HTTP::USERAGENT = $self->{user_agent};
+
+    # set the configfile md5 so we can check against it later
+    $self->configfile_md5($self->get_configfile_md5);
 }
 
 sub _build_r {
